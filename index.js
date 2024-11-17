@@ -1,185 +1,132 @@
 const http = require('http');
 const fs = require('fs');
 const url = require('url');
-const Connection = require('tedious').Connection;
-const Request = require('tedious').Request;
+const { Pool } = require('pg');
 
 // Database configuration
-const config = {
-    server: 'projectlibraryserver.database.windows.net',
-    authentication: {
-        type: 'default',
-        options: {
-            userName: 'internship82',
-            password: '$Sylylgo2ru'
-        }
-    },
-    options: {
-        encrypt: true,
-        database: 'library'
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false
     }
-};
+});
 
-// Function to handle database connection
-function connectToDatabase(callback) {
-    const connection = new Connection(config);
-    
-    connection.on('connect', function(err) {
-        if (err) {
-            console.error('Error: ', err);
-        } else {
-            console.log('Connected to database');
-            callback(connection);
-        }
-    });
-
-    connection.connect();
+// Function to initialize database
+async function initializeDatabase() {
+    const client = await pool.connect();
+    try {
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS Account (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                pin INTEGER NOT NULL
+            );
+        `);
+        console.log('Database initialized');
+    } catch (err) {
+        console.error('Error initializing database:', err);
+    } finally {
+        client.release();
+    }
 }
 
 // Function to authenticate user
-function authenticateUser(email, pin, callback) {
-    connectToDatabase(function(connection) {
-        const request = new Request(
-            `SELECT * FROM Account WHERE email='${email}' AND pin=${pin};`,
-            function(err, rowCount) {
-                if (err) {
-                    console.error('Error: ', err);
-                    callback(err);
-                } else {
-                    if (rowCount > 0) {
-                        callback(null, true); // User authenticated
-                    } else {
-                        callback(null, false); // User not found or pin incorrect
-                    }
-                }
-            }
+async function authenticateUser(email, pin) {
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            'SELECT * FROM Account WHERE email = $1 AND pin = $2',
+            [email, pin]
         );
-
-        connection.execSql(request);
-    });
+        return result.rowCount > 0;
+    } catch (err) {
+        console.error('Authentication error:', err);
+        throw err;
+    } finally {
+        client.release();
+    }
 }
 
-// Function to insert a new user into the Account table
-function createUser(name, email, pin, callback) {
-    connectToDatabase(function(connection) {
-        const request = new Request(
-            `INSERT INTO Account (name, email, pin) VALUES ('${name}', '${email}', ${pin});`,
-            function(err) {
-                if (err) {
-                    console.error('Error: ', err);
-                    callback(err);
-                } else {
-                    callback(null);
-                }
-            }
+// Function to create new user
+async function createUser(name, email, pin) {
+    const client = await pool.connect();
+    try {
+        await client.query(
+            'INSERT INTO Account (name, email, pin) VALUES ($1, $2, $3)',
+            [name, email, pin]
         );
-
-        connection.execSql(request);
-    });
+    } catch (err) {
+        console.error('Error creating user:', err);
+        throw err;
+    } finally {
+        client.release();
+    }
 }
+
+// Initialize database on startup
+initializeDatabase().catch(console.error);
 
 // Create a server
-http.createServer(function(req, res) {
+http.createServer(async function(req, res) {
     const q = url.parse(req.url, true);
     var filename = '.' + q.pathname;
+    
     if (filename === './') {
         filename = './login.html';
     }
+
     if (filename === './login') {
-        // Handle login request
-        const email = q.query.email;
-        const pin = parseInt(q.query.pin);
-        if (filename === './signup') {
-            // Redirect to signup page
-            res.writeHead(302, { 'Location': '/signup.html' });
-            res.end();
-        }
-        authenticateUser(email, pin, function(err, isAuthenticated) {
-            if (err) {
-                res.writeHead(500, { 'Content-Type': 'text/plain' });
-                res.end('Internal Server Error');
+        try {
+            const email = q.query.email;
+            const pin = parseInt(q.query.pin);
+            const isAuthenticated = await authenticateUser(email, pin);
+            
+            if (isAuthenticated) {
+                res.writeHead(302, { 'Location': '/homepage.html?email=' + encodeURIComponent(email) });
+                res.end();
             } else {
-                if (isAuthenticated) {
-                    // Redirect to homepage upon successful login
-                    res.writeHead(302, { 'Location': '/homepage.html?email=' + encodeURIComponent(email) });
-                    res.end();
-                } else {
-                    res.writeHead(401, { 'Content-Type': 'text/plain' });
-                    res.end('Invalid email or pin');
-                }
+                res.writeHead(401, { 'Content-Type': 'text/plain' });
+                res.end('Invalid email or pin');
             }
-        });
-    } else if (filename === './homepage.html') {
-        // Ensure authentication before serving homepage
-        const email = q.query.email || '';
-        if (!email) {
-            res.writeHead(401, { 'Content-Type': 'text/plain' });
-            res.end('Unauthorized');
-            return;
+        } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('Internal Server Error');
         }
-        fs.readFile('homepage.html', function(err, data) {
-            if (err) {
-                res.writeHead(404, { 'Content-Type': 'text/html' });
-                return res.end('404 Not Found');
-            }
-            // Replace placeholder with email
-            const modifiedData = data.toString().replace('{{email}}', email);
-            res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.write(modifiedData);
-            return res.end();
-        });
-    }
-    else if (filename === './logout') {
-        // Redirect to login page upon logout
-        res.writeHead(302, { 'Location': '/login.html' });
-        res.end();
-    }  
-    else if (filename === './signup' && req.method === 'POST') {
-        // Handle signup form submission
+    } else if (filename === './signup' && req.method === 'POST') {
         let body = '';
-        req.on('data', function(chunk) {
-            body += chunk.toString();
-        });
-        req.on('end', function() {
+        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('end', async () => {
             const formData = new URLSearchParams(body);
             const name = formData.get('name');
             const email = formData.get('email');
             const pin = parseInt(formData.get('pin'));
             
-            // Validate data
             if (!name || !email || !pin) {
                 res.writeHead(400, { 'Content-Type': 'text/plain' });
                 res.end('Missing required fields');
-            } else {
-                // Insert new user into database
-                createUser(name, email, pin, function(err) {
+                return;
+            }
+
+            try {
+                await createUser(name, email, pin);
+                fs.readFile('login.html', function(err, data) {
                     if (err) {
-                        res.writeHead(500, { 'Content-Type': 'text/plain' });
-                        res.end('Internal Server Error');
-                    } else {
-                        // Account created successfully message
-                        const successMessage = '<h3>Account created successfully!</h3>';
-                        
-                        // Serve the signup form with success message
-                        fs.readFile('login.html', function(err, data) {
-                            if (err) {
-                                res.writeHead(404, { 'Content-Type': 'text/html' });
-                                return res.end('404 Not Found');
-                            }
-                            const modifiedData = data.toString().replace('</body>', successMessage + '</body>');
-                            res.writeHead(200, { 'Content-Type': 'text/html' });
-                            res.write(modifiedData);
-                            return res.end();
-                        });
+                        res.writeHead(404, { 'Content-Type': 'text/html' });
+                        return res.end('404 Not Found');
                     }
+                    const modifiedData = data.toString().replace('</body>', '<h3>Account created successfully!</h3></body>');
+                    res.writeHead(200, { 'Content-Type': 'text/html' });
+                    res.write(modifiedData);
+                    res.end();
                 });
+            } catch (err) {
+                res.writeHead(500, { 'Content-Type': 'text/plain' });
+                res.end('Internal Server Error');
             }
         });
-    }
-    
-    else {
-        // Serve other static files (e.g., CSS, JS)
-        
+    } else {
+        // Serve static files
         fs.readFile(filename, function(err, data) {
             if (err) {
                 res.writeHead(404, { 'Content-Type': 'text/html' });
@@ -190,6 +137,6 @@ http.createServer(function(req, res) {
             return res.end();
         });
     }
-}).listen(8080);
+}).listen(process.env.PORT || 8080);
 
 console.log('Server running at http://localhost:8080/');
